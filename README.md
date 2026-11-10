@@ -6,7 +6,7 @@ A single-file, offline installer that puts Ubuntu on **Btrfs** (`@` + `@home` su
 
 ## Features
 
-- **One file.** Everything (installer + extras) is inside `ubuntu-btrfs-installer.sh`.
+- **One file.** Everything (installer + extras) is inside `ubuntu-26.04-btrfs-installer.sh`.
 - **Btrfs layout:** `@` (root) and `@home` (user data), mounted with `noatime,compress=zstd:1`.
 - **Separate `/boot` (ext4) and EFI (FAT32)** partitions, GRUB for UEFI (Secure Boot chain installed when online).
 - **Optional LUKS2 encryption** of the root partition.
@@ -41,7 +41,7 @@ Tested on Ubuntu 26.04 (GNOME).
 sudo apt update && sudo apt install -y git && 
 git clone https://github.com/AmrTarekElaasy/ubuntu-btrfs-installer.git
 cd ubuntu-btrfs-installer
-sudo bash ubuntu-btrfs-installer.sh
+sudo bash ubuntu-26.04-btrfs-installer.sh
 ```
 
 Then, in the menu: choose the **Disk**, plan the **Partitions**, set **Username / Password / Hostname / Timezone**, toggle the options you want, and choose **INSTALL**. When it finishes, remove the USB and reboot.
@@ -67,7 +67,7 @@ CopyQ opens with **Super+V**. GNOME's notification list moves to **Super+Shift+V
 
 ## Customizing
 
-Open `ubuntu-btrfs-installer.sh` and search for `emit_extra_packages`. Everything installed beyond the base system lives there. To add programs, add a line such as:
+Open `ubuntu-26.04-btrfs-installer.sh` and search for `emit_extra_packages`. Everything installed beyond the base system lives there. To add programs, add a line such as:
 
 ```bash
 install_each vlc htop git
