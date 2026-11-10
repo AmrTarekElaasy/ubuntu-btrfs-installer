@@ -38,6 +38,7 @@ Tested on Ubuntu 26.04 (GNOME).
 ## Usage
 
 ```bash
+sudo apt update && sudo apt install -y git && 
 git clone https://github.com/AmrTarekElaasy/ubuntu-btrfs-installer.git
 cd ubuntu-btrfs-installer
 sudo bash ubuntu-btrfs-installer.sh
