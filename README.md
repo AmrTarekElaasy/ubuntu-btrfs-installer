@@ -38,10 +38,10 @@ Tested on Ubuntu 26.04 (GNOME).
 ## Usage
 
 ```bash
-sudo apt update && sudo apt install -y git && 
-git clone https://github.com/AmrTarekElaasy/ubuntu-btrfs-installer.git
-cd ubuntu-btrfs-installer
-sudo bash ubuntu-26.04-btrfs-installer.sh
+wget https://raw.githubusercontent.com/AmrTarekElaasy/ubuntu-btrfs-installer/main/ubuntu-26.04-btrfs-installer.sh &&
+sudo chmod +x ubuntu-26.04-btrfs-installer.sh &&
+sudo ./ubuntu-26.04-btrfs-installer.sh
+
 ```
 
 Then, in the menu: choose the **Disk**, plan the **Partitions**, set **Username / Password / Hostname / Timezone**, toggle the options you want, and choose **INSTALL**. When it finishes, remove the USB and reboot.
