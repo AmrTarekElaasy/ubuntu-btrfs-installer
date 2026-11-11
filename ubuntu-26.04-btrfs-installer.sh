@@ -21,6 +21,8 @@
 #    touched until you choose INSTALL, review the summary and confirm.
 #  - PARTITIONS (modes 1 and 3): three INDEPENDENT pages - Root (Btrfs),
 #    Boot, EFI. Fixing one page never redoes the others.
+#  - EDIT PARTITIONS: opens GNOME Disks (the menu is hidden meanwhile); when Disks is
+#    closed the installer un-mounts whatever Disks mounted/unlocked and re-reads the disk.
 #  - MAIN MENU shows a short plan: which partitions, their size, and what
 #    will be FORMATTED and what is kept.
 #  - UI CUSTOMIZATION (yes/no page, default YES): dock at the bottom + auto-hide,
@@ -172,7 +174,7 @@ EOF
         if [ "$HAVE_NET" = true ]; then
             apt-get update -y && apt-get install -y cryptsetup-initramfs
         else
-            echo "FATAL: cryptsetup-initramfs missing and no network; the system would not unlock at boot." >&2
+            echo "FATAL: the installation stopped because the LUKS disk encryption needs internet (cryptsetup-initramfs is missing and there is no network); without it the system would not unlock at boot. Connect to the internet and retry." >&2
             exit 1
         fi
     fi
@@ -650,6 +652,12 @@ rofs_has_pkg() { # $1 package installed in the live image?
         "$ROFS/var/lib/dpkg/status" 2>/dev/null
 }
 
+# Short note shown next to every "Encrypt with LUKS?" question.
+# Encryption needs cryptsetup-initramfs; if the live image lacks it, it is downloaded.
+luks_net_note() {
+    if rofs_has_pkg cryptsetup-initramfs; then echo "(no internet needed)"; else echo "(INTERNET REQUIRED)"; fi
+}
+
 # $1 device, $2 role (EFI|boot). Returns 1 (with an explanation) if the partition is
 # abnormally large for that role, so the caller can ask again instead of continuing.
 size_sane() {
@@ -781,6 +789,115 @@ unlock_luks() { # $1 raw dev
         fi
         ui_msg "LUKS" "Wrong passphrase."
     done
+}
+
+# ---- Edit partitions with GNOME Disks, like a real installer ----
+# The installer menu is left, GNOME Disks opens (as the live user). When it is closed,
+# everything Disks mounted or unlocked is released again, udisks2 is stopped/masked again
+# (as in preflight), and the disk is re-read. If the layout is unchanged the plan is kept;
+# if it changed, the partition plan is cleared (it would point at stale partitions).
+disk_layout_sig() {
+    lsblk -nbrpo NAME,TYPE,SIZE,FSTYPE,UUID,PARTUUID,LABEL "$DISK" 2>/dev/null \
+        | awk '$2=="disk" || $2=="part"' || true
+}
+
+disks_user() {
+    local u=${SUDO_USER:-}
+    if [ -z "$u" ] || [ "$u" = root ]; then
+        u=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | grep -v '^root$' | head -n1 || true)
+    fi
+    if [ -z "$u" ]; then u=$(ls /home 2>/dev/null | head -n1 || true); fi
+    echo "$u"
+}
+
+edit_partitions() {
+    local u uid rt s wl before after reopen=false rc=0
+    local env_args=()
+    if [ -z "$DISK" ]; then ui_msg "Edit partitions" "Select the disk first."; return 1; fi
+    if ! command -v gnome-disks >/dev/null 2>&1; then
+        if have_net; then
+            ui_info "Installing GNOME Disks (gnome-disk-utility)..."
+            apt-get install -y gnome-disk-utility >/dev/null 2>&1 || true
+        fi
+        if ! command -v gnome-disks >/dev/null 2>&1; then
+            ui_msg "Edit partitions" "GNOME Disks (gnome-disk-utility) is not installed and could not be installed (no internet?)."
+            return 1
+        fi
+    fi
+    u=$(disks_user)
+    if [ -z "$u" ] || ! id -u "$u" >/dev/null 2>&1; then
+        ui_msg "Edit partitions" "Could not find the desktop user to run GNOME Disks as."
+        return 1
+    fi
+    uid=$(id -u "$u"); rt=/run/user/$uid
+    if [ ! -d "$rt" ]; then
+        ui_msg "Edit partitions" "No desktop session found for user '$u', so GNOME Disks cannot open. Run the installer from a terminal inside the live desktop."
+        return 1
+    fi
+    if ! yesno "GNOME Disks will open so you can create, resize or delete partitions.${NL}${NL}The installer menu is hidden meanwhile. When you CLOSE Disks, the installer comes back, un-mounts everything Disks mounted and re-reads the disk.${NL}${NL}Tip: only change partitions, do not mount or use them." y "Open Disks" "Cancel"; then
+        return 1
+    fi
+
+    before=$(disk_layout_sig)
+    # release what the installer itself holds open on this disk (LUKS unlocked on the Btrfs page)
+    if [ "$LUKS_OPENED" = true ]; then
+        if cryptsetup close "$MAPPER" 2>/dev/null; then
+            reopen=true; LUKS_OPENED=false; ACTIVE_DEV=""
+        fi
+    fi
+
+    # Disks needs udisks2 (the installer keeps it stopped and masked)
+    systemctl unmask --runtime udisks2 2>/dev/null || true
+    systemctl start udisks2 2>/dev/null || true
+    sleep 1
+
+    env_args=(XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" DISPLAY="${DISPLAY:-:0}")
+    wl=""
+    for s in "$rt"/wayland-[0-9]*; do
+        if [ -S "$s" ]; then wl=${s##*/}; break; fi
+    done
+    if [ -n "$wl" ]; then env_args+=(WAYLAND_DISPLAY="$wl"); fi
+
+    { clear; echo "GNOME Disks is open."; echo "Edit the partitions, then CLOSE the Disks window to come back to the installer."; } >"$TTY_DEV" 2>/dev/null || true
+    runuser -u "$u" -- env "${env_args[@]}" gnome-disks </dev/null >/dev/null 2>&1 || rc=$?
+    # gnome-disks may hand over to an already running instance: wait until it is really closed
+    while pgrep -u "$u" -x gnome-disks >/dev/null 2>&1; do sleep 1; done
+
+    # ---- back in the installer: release everything Disks touched, re-read the disk ----
+    ui_info "Re-reading the disk..."
+    udevadm settle 2>/dev/null || true
+    partprobe "$DISK" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+    force_unmount_disk
+    systemctl stop udisks2 2>/dev/null || true
+    systemctl mask --runtime udisks2 2>/dev/null || true
+    sleep 1
+    force_unmount_disk
+    if [ "$rc" -ne 0 ]; then ui_msg "Edit partitions" "GNOME Disks could not start (exit code $rc). The disk was not changed by the installer."; fi
+
+    after=$(disk_layout_sig)
+    if [ "$before" != "$after" ]; then
+        if [ -n "$MODE" ]; then
+            reset_plan
+            ui_msg "Edit partitions" "The partition layout changed.${NL}${NL}The old partition choices were cleared (they could point at partitions that no longer exist). Open Partitions again to choose the mode and the partitions."
+        else
+            ui_msg "Edit partitions" "The partition layout changed. Open Partitions to choose the mode and the partitions."
+        fi
+        return 0
+    fi
+
+    # unchanged: keep the plan; unlock the root again if we had closed it
+    if [ "$reopen" = true ]; then
+        if printf '%s' "$LUKS_OLDPASS" | cryptsetup open "$RAW_ROOT" "$MAPPER" - 2>/dev/null; then
+            LUKS_OPENED=true; ACTIVE_DEV=/dev/mapper/$MAPPER
+        else
+            root_clear
+            ui_msg "Edit partitions" "The encrypted root could not be unlocked again. Open Partitions and choose the Btrfs page again."
+            return 0
+        fi
+    fi
+    ui_msg "Edit partitions" "The disk layout is unchanged. Your plan was kept."
+    return 0
 }
 
 # Delete a subvolume tree under $TOP. Refuses to touch @home unless WIPE_HOME=true.
@@ -1105,7 +1222,7 @@ page_root_m3() {
         ui_msg "Btrfs partition (root /)" "$sel is already chosen as /boot or EFI. Choose another partition."
         return 1
     fi
-    if yesno "Encrypt the root partition with LUKS?" "$(dflt "$USE_LUKS")"; then
+    if yesno "Encrypt the root partition with LUKS?  $(luks_net_note)${NL}${NL}Encryption needs the package cryptsetup-initramfs; if it is not in the live image it is downloaded, so an internet connection is required." "$(dflt "$USE_LUKS")"; then
         if ! ask_new_pass "New LUKS passphrase"; then
             ui_msg "Btrfs partition (root /)" "No passphrase was set. The Btrfs page was not changed."
             return 1
@@ -1223,6 +1340,7 @@ plan_hub() {
             Btrfs "$(brief_root)" \
             Boot  "$(brief_boot)" \
             EFI   "$(brief_efi)" \
+            Disks "Edit partitions with GNOME Disks (create / resize / delete)" \
             Mode  "Change the installation mode" \
             Check "Check the whole plan now" \
             Done  "Finish: go back to the main menu"; then
@@ -1232,6 +1350,8 @@ plan_hub() {
             Btrfs) if [ "$MODE" = 1 ]; then page_root_m1 || true; else page_root_m3 || true; fi ;;
             Boot)  page_boot || true ;;
             EFI)   page_efi || true ;;
+            Disks) edit_partitions || true
+                   if [ -z "$MODE" ]; then return 0; fi ;;     # the plan was cleared: back to the main menu
             Mode)  if choose_mode; then
                        if [ "$MODE" = 2 ] || [ "$MODE" = 4 ]; then refresh_plan; return 2; fi
                    fi ;;
@@ -1326,7 +1446,7 @@ plan_mode2() {
     if [ "$REUSE_EFI" = true ]; then CREATE_EFI=false; else CREATE_EFI=true; fi
     CREATE_BOOT=true; CREATE_ROOT=true
     FORMAT_ROOT=true; FORMAT_BOOT=true     # only the NEW partitions
-    if yesno "Encrypt the new root partition with LUKS?" n; then
+    if yesno "Encrypt the new root partition with LUKS?  $(luks_net_note)${NL}${NL}Encryption needs the package cryptsetup-initramfs; if it is not in the live image it is downloaded, so an internet connection is required." n; then
         if ask_new_pass "New LUKS passphrase"; then
             USE_LUKS=true; LUKS_PASS=$REPLY
         else
@@ -1348,7 +1468,7 @@ disk_has_live_part() {
 wipe_confirm() {
     local name=${DISK#/dev/}
     while true; do
-        ui_input "$1" "THE WHOLE DISK $DISK WILL BE ERASED.${NL}Type the disk name ($name) to confirm (Back = cancel):" "" || return 1
+        ui_input "$1" "THE WHOLE DISK WILL BE ERASED:${NL}  $(disk_desc "$DISK")${NL}${NL}Type the disk name ($name) to confirm (Back = cancel):" "" || return 1
         if [ "$REPLY" = "$name" ] || [ "$REPLY" = "$DISK" ]; then return 0; fi
         ui_msg "$1" "'$REPLY' does not match '$name'. Try again."
     done
@@ -1380,7 +1500,7 @@ plan_mode4() {
     CREATE_EFI=true; CREATE_BOOT=true; CREATE_ROOT=true
     FORMAT_ROOT=true; FORMAT_BOOT=true; FORMAT_EFI=true
     EFI_SIZE="+512M"; BOOT_SIZE="+2G"
-    if yesno "Encrypt the new root partition with LUKS?" n; then
+    if yesno "Encrypt the new root partition with LUKS?  $(luks_net_note)${NL}${NL}Encryption needs the package cryptsetup-initramfs; if it is not in the live image it is downloaded, so an internet connection is required." n; then
         if ask_new_pass "New LUKS passphrase"; then
             USE_LUKS=true; LUKS_PASS=$REPLY
         else
@@ -1762,7 +1882,7 @@ validate_options() {
             why+=("GRUB EFI modules (grub-efi-amd64-bin, needed for the bootloader)"); hard=true
         fi
         if [ "$USE_LUKS" = true ] && ! rofs_has_pkg cryptsetup-initramfs; then
-            why+=("cryptsetup-initramfs (needed to unlock the encrypted disk at boot)"); hard=true
+            why+=("DISK ENCRYPTION (LUKS): the encryption you chose for the disk needs internet (package cryptsetup-initramfs, needed to unlock the disk at boot)"); hard=true
         fi
         if [ "$WANT_CODECS" = true ];  then why+=("restricted media codecs"); fi
         if [ "$WANT_DRIVERS" = true ]; then why+=("proprietary drivers"); fi
@@ -1774,6 +1894,9 @@ validate_options() {
         txt="NO INTERNET. The install needs it for:"
         for w in "${why[@]}"; do txt+="${NL}  - $w"; done
         items=(r "Re-check (connect Wi-Fi / cable first)")
+        if [ "$USE_LUKS" = true ] && ! rofs_has_pkg cryptsetup-initramfs; then
+            txt+="${NL}${NL}The installation cannot continue because the LUKS encryption on the disk needs internet. Connect, or go back and turn encryption off."
+        fi
         if [ "$hard" != true ]; then items+=(c "Continue WITHOUT the optional extras (install them after the first boot)"); fi
         if ! ui_menu "No internet" "$txt" "${items[@]}"; then return 1; fi
         if [ "$REPLY" = c ]; then WANT_CODECS=false; WANT_DRIVERS=false; WANT_EXTRAS=false; return 0; fi
@@ -1786,34 +1909,34 @@ validate_options() {
 typed_confirm() { # $1 device ; returns 1 if the user gives up
     local name=${1#/dev/}
     while true; do
-        ui_input "Confirm erase" "Type '$name' to confirm it will be ERASED (Back = abort):" "" || return 1
+        ui_input "Confirm erase" "This partition will be ERASED:${NL}  $(part_desc "$1")${NL}${NL}Type '$name' to confirm (Back = abort):" "" || return 1
         if [ "$REPLY" = "$name" ]; then return 0; fi
         ui_msg "Confirm erase" "Does not match."
     done
 }
 
 summary_text() {
-    echo "Disk              : $DISK"
+    echo "Disk              : $(disk_desc "$DISK")"
     if [ "$WIPE_DISK" = true ]; then
         echo "WHOLE DISK        : ERASED - every partition and all data on $DISK is destroyed"
         echo "Partition table   : NEW GPT with 3 new partitions"
     elif [ "$NEED_GPT" = true ]; then echo "Partition table   : NEW GPT (blank disk)"; fi
     if [ "$CREATE_ROOT" = true ]; then
-        echo "Btrfs partition   : NEW, uses the rest of the free space"
+        echo "Btrfs partition   : NEW, about $(new_root_text) (all the space left after EFI and /boot)"
     else
-        echo "Btrfs partition   : $RAW_ROOT ($(sz_of "$RAW_ROOT")) $([ "$FORMAT_ROOT" = true ] && echo "-> FORMATTED (everything on it incl. any @home is lost)" || echo "(kept, not formatted)")"
+        echo "Btrfs partition   : $(part_desc "$RAW_ROOT") $([ "$FORMAT_ROOT" = true ] && echo "-> FORMATTED (everything on it incl. any @home is lost)" || echo "(kept, not formatted)")"
     fi
     if [ "$CREATE_BOOT" = true ]; then
         echo "Boot partition    : NEW ${BOOT_SIZE#+}iB, created in free space"
     else
-        echo "Boot partition    : $BOOT_PART ($(sz_of "$BOOT_PART")) $([ "$FORMAT_BOOT" = true ] && echo "-> FORMATTED" || echo "(kept, only old kernels replaced)")"
+        echo "Boot partition    : $(part_desc "$BOOT_PART") $([ "$FORMAT_BOOT" = true ] && echo "-> FORMATTED" || echo "(kept, only old kernels replaced)")"
     fi
     if [ "$CREATE_EFI" = true ]; then
         echo "EFI partition     : NEW ${EFI_SIZE#+}iB, created in free space"
     else
-        echo "EFI partition     : $EFI_PART ($(sz_of "$EFI_PART")) $([ "$FORMAT_EFI" = true ] && echo "-> FORMATTED" || echo "(kept, not formatted)")"
+        echo "EFI partition     : $(part_desc "$EFI_PART") $([ "$FORMAT_EFI" = true ] && echo "-> FORMATTED" || echo "(kept, not formatted)")"
     fi
-    echo "LUKS encryption   : $USE_LUKS"
+    echo "LUKS encryption   : $USE_LUKS$([ "$USE_LUKS" = true ] && echo "  $(luks_net_note)")"
     if [ "$CHANGE_LUKS_PASS" = true ]; then echo "LUKS passphrase   : will be CHANGED to the new one you entered"; fi
     if [ "$MODE" = 1 ]; then
         echo "Subvolume @       : $([ "$ROOT_STATE" = present ] && echo "existing one DELETED and recreated" || echo "created")"
@@ -1915,6 +2038,48 @@ do_review_install() {
 # ============================================================
 yn() { if [ "$1" = true ]; then echo "yes"; else echo "no"; fi; }
 
+# ---- readable descriptions used on the summary and on the "type the name" screens ----
+# disk_desc /dev/sda  -> "/dev/sda  (size 476.9G, model Samsung SSD 970)"
+disk_desc() {
+    local sz mdl
+    sz=$(lsblk -dno SIZE "$1" 2>/dev/null | tr -d ' ' || true)
+    mdl=$(lsblk -dno MODEL "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | cut -c1-40 || true)
+    echo "$1  (size ${sz:-?}${mdl:+, model $mdl})"
+}
+# part_desc /dev/sda3 -> "/dev/sda3  (size 400G, fs btrfs, label ubuntu)"
+part_desc() {
+    local sz fs lb
+    sz=$(lsblk -dno SIZE "$1" 2>/dev/null | tr -d ' ' || true)
+    fs=$(fstype_of "$1")
+    lb=$(lsblk -dno LABEL "$1" 2>/dev/null | sed 's/^ //;s/ $//' || true)
+    echo "$1  (size ${sz:-?}, fs ${fs:--}${lb:+, label $lb})"
+}
+# "+512M" / "+2G" -> MiB
+size_to_mib() {
+    local v=${1#+}
+    case "$v" in
+        *G) echo $(( ${v%G} * 1024 )) ;;
+        *M) echo "${v%M}" ;;
+        *)  echo 0 ;;
+    esac
+}
+# Size the NEW Btrfs partition will get: all the space left after the new EFI and /boot.
+new_root_text() {
+    local bytes mib
+    if [ "$WIPE_DISK" = true ]; then
+        bytes=$(lsblk -bdno SIZE "$DISK" 2>/dev/null | head -n1 || true)
+    else
+        bytes=$(largest_free_bytes)
+    fi
+    [[ $bytes =~ ^[0-9]+$ ]] || bytes=0
+    mib=$(( bytes / 1048576 ))
+    if [ "$CREATE_EFI" = true ];  then mib=$(( mib - $(size_to_mib "$EFI_SIZE") )); fi
+    if [ "$CREATE_BOOT" = true ]; then mib=$(( mib - $(size_to_mib "$BOOT_SIZE") )); fi
+    mib=$(( mib - 2 ))
+    if [ "$mib" -lt 0 ]; then mib=0; fi
+    numfmt --to=iec --round=down --format=%.1f $(( mib * 1048576 )) 2>/dev/null || echo "$((mib / 1024))G"
+}
+
 lbl_disk() {
     if [ -z "$DISK" ]; then echo "(not selected)"; return 0; fi
     echo "$DISK  $(lsblk -dno SIZE,MODEL "$DISK" 2>/dev/null | tr -s ' ' | cut -c1-40 || true)"
@@ -1949,6 +2114,7 @@ main_menu() { # returns 0 when the user confirmed the installation
         if ui_menu "Ubuntu Btrfs Installer" "$txt" \
             Disk        "$(lbl_disk)" \
             Partitions  "$(lbl_plan)" \
+            "Edit partitions" "Open GNOME Disks (create / resize / delete)" \
             Username    "${NEW_USER:-(not set)}" \
             Password    "$pw" \
             Hostname    "$NEW_HOST" \
@@ -1967,6 +2133,7 @@ main_menu() { # returns 0 when the user confirmed the installation
             Disk)       select_disk || true ;;
             Partitions) run_plan || true
                         if [ "$PLAN_OK" = true ] && [ -n "$NEW_USER" ]; then match_user_to_home; fi ;;
+            "Edit partitions") edit_partitions || true ;;
             Username)   ask_username || true ;;
             Password)   ask_password || true ;;
             Hostname)   ask_hostname || true ;;
@@ -2563,6 +2730,9 @@ EOF
 
     # ---- Discover (the installer then puts it in the dock instead of Ubuntu Software) ----
     install_each plasma-discover plasma-discover-backend-flatpak
+
+    # ---- GNOME Extension Manager (app to browse / enable / disable GNOME Shell extensions) ----
+    install_each gnome-shell-extension-manager
 
     # ---- your own programs: add more lines here ----
     # install_each vlc htop git
