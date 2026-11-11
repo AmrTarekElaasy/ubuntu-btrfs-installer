@@ -31,6 +31,14 @@
 #    You fix the problem (even from a shell opened by the installer) and
 #    choose "retry"; finished work is not redone and your answers are kept.
 # ============================================================
+# This installer needs bash (arrays, [[ ]], process substitution). If it was started with
+# another shell (sh / dash / "sudo dash script.sh"), restart it with bash right away.
+# This check uses only syntax that every shell understands, so it must stay at the top.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then exec bash "$0" "$@"; fi
+    echo "This installer needs bash. Run it like this:  sudo bash $0" >&2
+    exit 1
+fi
 set -Eeuo pipefail
 
 SCRIPT_PATH=$(readlink -f "$0")
@@ -181,6 +189,17 @@ EOF
         for p in grub-efi-amd64-signed shim-signed; do
             dpkg -s "$p" >/dev/null 2>&1 || apt-get install -y "$p" || echo "[WARN] could not install $p (Secure Boot may not work)"
         done
+    fi
+
+    # dracut (Ubuntu 26.04) needs the btrfs tools to put Btrfs support into the initramfs.
+    # The live image does not ship them, so install them first (otherwise the log shows
+    # "btrfs: command not found" and the initramfs is built without them).
+    if ! command -v btrfs >/dev/null 2>&1; then
+        if [ "$HAVE_NET" = true ]; then
+            apt-get install -y btrfs-progs || echo "[WARN] could not install btrfs-progs; the initramfs may lack Btrfs tools"
+        else
+            echo "[WARN] btrfs-progs is missing and there is no network: after the first boot run 'sudo apt install btrfs-progs && sudo update-initramfs -u'"
+        fi
     fi
 
     echo "==> [chroot] initramfs + GRUB"
@@ -430,6 +449,7 @@ FS_UUID=""; BOOT_UUID=""; EFI_UUID=""
 NEW_USER=""; NEW_PASS=""; NEW_HOST="ubuntu-pc"; NEW_TZ="Africa/Cairo"
 WANT_CODECS=false; WANT_DRIVERS=false; WANT_EXTRAS=true; WANT_UI=true
 DONE_LUKSFMT=false; DONE_ROOTFMT=false; DONE_EFIFMT=false; DONE_BOOTFMT=false
+CHANGE_LUKS_PASS=false; LUKS_OLDPASS=""; LUKS_NEWPASS=""; DONE_LUKSPASS=false
 WIPE_DISK=false; DONE_WIPE=false
 HOME_OLDDIR=""; OLD_AT_EXCL=""; BOOT_ODD=""
 VERR=(); VWARN=()
@@ -441,7 +461,7 @@ UI_W=76; UI_H=22; UI_LH=10; UI_ROWS=24; UI_DEFAULT=""
 # so that "retry" continues exactly where the step stopped. No secrets in here.
 STATE_VARS=(EFI_PART BOOT_PART RAW_ROOT ACTIVE_DEV CREATE_EFI CREATE_BOOT CREATE_ROOT NEED_GPT
             LUKS_OPENED LUKS_UUID FS_UUID BOOT_UUID EFI_UUID
-            DONE_LUKSFMT DONE_ROOTFMT DONE_EFIFMT DONE_BOOTFMT DONE_WIPE
+            DONE_LUKSFMT DONE_ROOTFMT DONE_EFIFMT DONE_BOOTFMT DONE_LUKSPASS DONE_WIPE
             HOME_STATE WIPE_HOME HOME_OLDDIR RESOLV_BACKED)
 
 save_state() {
@@ -563,11 +583,15 @@ ui_pass() { # $1 title, $2 text -> REPLY ; 1 on Back
 }
 
 # yesno "question" default(y|n)  -> 0 = yes
+# yesno "question" default(y|n) ["Yes button text" "No button text"]
+# The optional button texts make a choice explicit, e.g. "Yes, format @home" / "No, keep @home".
 yesno() {
-    local dflag=()
+    local dflag=() lbl=()
     if [ "${2:-n}" = n ]; then dflag=(--defaultno); fi
+    if [ -n "${3:-}" ]; then lbl+=(--yes-button "$3"); fi
+    if [ -n "${4:-}" ]; then lbl+=(--no-button "$4"); fi
     ui_dims
-    if wt_box --title "Question" "${dflag[@]}" --yesno "$1" 0 "$UI_W"; then return 0; fi
+    if wt_box --title "Question" "${dflag[@]}" "${lbl[@]}" --yesno "$1" 0 "$UI_W"; then return 0; fi
     return 1
 }
 
@@ -752,6 +776,7 @@ unlock_luks() { # $1 raw dev
         [ -n "$pass" ] || return 1
         if printf '%s' "$pass" | cryptsetup open "$1" "$MAPPER" -; then
             LUKS_OPENED=true; ACTIVE_DEV=/dev/mapper/$MAPPER
+            LUKS_OLDPASS=$pass
             return 0
         fi
         ui_msg "LUKS" "Wrong passphrase."
@@ -976,7 +1001,35 @@ root_clear() {
     if findmnt -rn "$TOP" >/dev/null 2>&1; then umount "$TOP" 2>/dev/null || true; fi
     if [ "$LUKS_OPENED" = true ]; then cryptsetup close "$MAPPER" 2>/dev/null || true; LUKS_OPENED=false; fi
     RAW_ROOT=""; ACTIVE_DEV=""; USE_LUKS=false; LUKS_UUID=""; LUKS_PASS=""
+    CHANGE_LUKS_PASS=false; LUKS_OLDPASS=""; LUKS_NEWPASS=""
     HOME_STATE=none; ROOT_STATE=none; WIPE_HOME=false; OLD_AT_EXCL=""; WARN_ACK=false
+    return 0
+}
+
+# Mode 1, encrypted root: offer to change the LUKS passphrase. Planning only: the change is
+# applied when the installation starts (do_filesystems), never before.
+ask_change_luks_pass() {
+    CHANGE_LUKS_PASS=false; LUKS_NEWPASS=""
+    if ! yesno "The root partition is encrypted (LUKS).${NL}${NL}Change the encryption passphrase?${NL}${NL}  No, keep it    = the current passphrase stays (default)${NL}  Yes, change it = you set a new one (applied only when the installation starts)" n "Yes, change it" "No, keep it"; then
+        return 0
+    fi
+    # the current passphrase is needed (it is already known if we unlocked the disk ourselves)
+    while [ -z "$LUKS_OLDPASS" ]; do
+        if ! ui_pass "Current LUKS passphrase" "Enter the CURRENT passphrase of $RAW_ROOT (Back = keep it unchanged):"; then
+            ui_msg "LUKS" "The passphrase will stay unchanged."; return 0
+        fi
+        if printf '%s' "$REPLY" | cryptsetup open --test-passphrase "$RAW_ROOT" --key-file=- 2>/dev/null; then
+            LUKS_OLDPASS=$REPLY
+        else
+            ui_msg "LUKS" "Wrong passphrase."
+        fi
+    done
+    if ask_new_pass "New LUKS passphrase"; then
+        LUKS_NEWPASS=$REPLY; CHANGE_LUKS_PASS=true
+        ui_msg "LUKS" "The passphrase will be changed when the installation starts."
+    else
+        ui_msg "LUKS" "No new passphrase was set: it will stay unchanged."
+    fi
     return 0
 }
 
@@ -1025,12 +1078,15 @@ page_root_m1() {
     umount "$TOP"
     ui_text "Subvolumes found on $sel" "${subs:-(none)}" trunc
 
+    if [ "$USE_LUKS" = true ]; then ask_change_luks_pass; fi
+
     if [ "$HOME_STATE" != none ]; then
-        if yesno "An existing @home was found.${NL}KEEP it (your user files stay untouched)?${NL}${NL}  Yes = keep @home${NL}  No  = FORMAT @home (all user files lost, you will be asked to confirm)" y; then
-            WIPE_HOME=false
-        else
+        # The question is about DELETING, and the default button is No: just pressing Enter keeps your files.
+        if yesno "An existing @home was found (your user files).${NL}${NL}Format @home?${NL}${NL}  No, keep @home    = your files stay untouched (default, recommended)${NL}  Yes, format @home = ALL user files are lost (you will be asked to confirm)" n "Yes, format @home" "No, keep @home"; then
             if ui_input "Delete @home?" "Deleting @home destroys ALL user files in it.${NL}Type DELETE-HOME to confirm (anything else keeps it):" ""; then a=$REPLY; else a=""; fi
             if [ "$a" = "DELETE-HOME" ]; then WIPE_HOME=true; else WIPE_HOME=false; ui_msg "@home" "Keeping @home."; fi
+        else
+            WIPE_HOME=false
         fi
     fi
     FORMAT_ROOT=false
@@ -1096,9 +1152,9 @@ page_boot() {
     fi
     if ! size_sane "$sel" boot; then return 1; fi
     if [ "$(fstype_of "$sel")" != ext4 ]; then
-        if ! yesno "$sel is not ext4.${NL}FORMAT it as ext4? Everything on it is lost." y; then return 1; fi
+        if ! yesno "$sel is not ext4.${NL}Format it as ext4? Everything on it is lost." y "Yes, format /boot" "No, choose another"; then return 1; fi
         fmt=true
-    elif yesno "RE-FORMAT $sel ?${NL}This wipes it.${NL}(Default: Yes. Choose No to keep its files; old kernels are replaced either way.)" y; then
+    elif yesno "Format $sel as /boot?${NL}Formatting wipes it.${NL}(Default: Yes. Choose No to keep its files; old kernels are replaced either way.)" y "Yes, format /boot" "No, keep /boot"; then
         fmt=true
     elif ! boot_looks_ok "$sel"; then
         if ! yesno "$sel holds files that do not look like a /boot:${NL}$BOOT_ODD${NL}${NL}Use it as /boot anyway (those files stay untouched)?" n; then return 1; fi
@@ -1140,9 +1196,9 @@ page_efi() {
     fi
     if ! size_sane "$sel" EFI; then return 1; fi
     if [ "$(fstype_of "$sel")" != vfat ]; then
-        if ! yesno "$sel is not vfat.${NL}FORMAT it as FAT32? Everything on it is lost." y; then return 1; fi
+        if ! yesno "$sel is not vfat.${NL}Format it as FAT32? Everything on it is lost." y "Yes, format EFI" "No, choose another"; then return 1; fi
         fmt=true
-    elif yesno "RE-FORMAT $sel ?${NL}This wipes it, including Windows / other OS boot files.${NL}(Default: Yes. Choose No to keep it.)" y; then
+    elif yesno "Format $sel as EFI?${NL}Formatting wipes it, including Windows / other OS boot files.${NL}(Default: Yes. Choose No to keep it.)" y "Yes, format EFI" "No, keep EFI"; then
         fmt=true
     fi
     EFI_PART=$sel; CREATE_EFI=false; FORMAT_EFI=$fmt; WARN_ACK=false
@@ -1366,6 +1422,7 @@ reset_plan() {
     MODE=""
     RAW_ROOT=""; ACTIVE_DEV=""; BOOT_PART=""; EFI_PART=""
     USE_LUKS=false; LUKS_PASS=""; LUKS_UUID=""
+    CHANGE_LUKS_PASS=false; LUKS_OLDPASS=""; LUKS_NEWPASS=""
     FORMAT_ROOT=false; FORMAT_BOOT=false; FORMAT_EFI=false
     CREATE_EFI=false; CREATE_BOOT=false; CREATE_ROOT=false
     EFI_SIZE="+512M"; BOOT_SIZE="+2G"; SIZE_TIER=none; NEED_MIN_MIB=0
@@ -1643,7 +1700,12 @@ ask_username() { # returns 1 if the user went Back (old value kept)
 
 ask_password() {
     if [ -z "$NEW_USER" ]; then ui_msg "Password" "Set the username first."; return 1; fi
-    if ask_new_pass "Password for $NEW_USER"; then NEW_PASS=$REPLY; fi
+    if ask_new_pass "Password for $NEW_USER"; then
+        NEW_PASS=$REPLY
+        if [ "${#NEW_PASS}" -lt 8 ]; then
+            ui_msg "Password" "This password is shorter than 8 characters. It is accepted, but a longer one is safer (you can change it later with: passwd)."
+        fi
+    fi
     return 0
 }
 
@@ -1752,6 +1814,7 @@ summary_text() {
         echo "EFI partition     : $EFI_PART ($(sz_of "$EFI_PART")) $([ "$FORMAT_EFI" = true ] && echo "-> FORMATTED" || echo "(kept, not formatted)")"
     fi
     echo "LUKS encryption   : $USE_LUKS"
+    if [ "$CHANGE_LUKS_PASS" = true ]; then echo "LUKS passphrase   : will be CHANGED to the new one you entered"; fi
     if [ "$MODE" = 1 ]; then
         echo "Subvolume @       : $([ "$ROOT_STATE" = present ] && echo "existing one DELETED and recreated" || echo "created")"
         case "$HOME_STATE:$WIPE_HOME" in
@@ -2032,8 +2095,24 @@ do_partitioning() {
 }
 
 do_filesystems() {
-    local d mt
+    local d mt kf_old kf_new
     force_unmount_disk
+    if [ "$CHANGE_LUKS_PASS" = true ] && [ "$DONE_LUKSPASS" != true ]; then
+        msg "Changing the LUKS passphrase of $RAW_ROOT"
+        kf_old=$(mktemp); kf_new=$(mktemp)
+        chmod 600 "$kf_old" "$kf_new"
+        printf '%s' "$LUKS_OLDPASS" > "$kf_old"
+        printf '%s' "$LUKS_NEWPASS" > "$kf_new"
+        if cryptsetup luksChangeKey --batch-mode --key-file "$kf_old" "$RAW_ROOT" "$kf_new"; then
+            rm -f "$kf_old" "$kf_new"
+            DONE_LUKSPASS=true
+            LUKS_OLDPASS=$LUKS_NEWPASS
+            ok "LUKS passphrase changed"
+        else
+            rm -f "$kf_old" "$kf_new"
+            die "Could not change the LUKS passphrase. Nothing else was changed yet; fix the cause and choose retry."
+        fi
+    fi
     for d in "$RAW_ROOT" "$BOOT_PART" "$EFI_PART"; do
         if [ -n "$d" ]; then
             mt=$(findmnt -rn -S "$d" -o TARGET 2>/dev/null | head -n1 || true)
@@ -2427,7 +2506,7 @@ EOF
         mkdir -p /etc/systemd
         cat > /etc/systemd/zram-generator.conf <<'EOF'
 [zram0]
-zram-size = min(ram / 2, 4096)
+zram-size = ram / 2
 compression-algorithm = zstd
 swap-priority = 100
 EOF
@@ -2436,7 +2515,44 @@ EOF
     fi
 
     # ---- Timeshift (snapshots; works with the @ / @home Btrfs layout) ----
-    install_each timeshift btrfs-progs
+    install_each timeshift btrfs-progs cron
+    # Default Timeshift settings so it works out of the box (no first-run wizard needed):
+    # Btrfs mode, snapshots of @ (the system) only - @home (your files) is NOT included.
+    # Schedule: keep 5 daily + 2 weekly snapshots (change the two numbers to taste).
+    TS_DAILY=5
+    TS_WEEKLY=2
+    if is_installed timeshift && [ -n "${FS_UUID:-}" ]; then
+        TS_PARENT=""
+        if [ "${USE_LUKS:-false}" = true ]; then TS_PARENT=${LUKS_UUID:-}; fi
+        mkdir -p /etc/timeshift
+        cat > /etc/timeshift/timeshift.json <<EOF
+{
+  "backup_device_uuid" : "$FS_UUID",
+  "parent_device_uuid" : "$TS_PARENT",
+  "do_first_run" : "false",
+  "btrfs_mode" : "true",
+  "include_btrfs_home_for_backup" : "false",
+  "include_btrfs_home_for_restore" : "false",
+  "stop_cron_emails" : "true",
+  "schedule_monthly" : "false",
+  "schedule_weekly" : "true",
+  "schedule_daily" : "true",
+  "schedule_hourly" : "false",
+  "schedule_boot" : "false",
+  "count_monthly" : "2",
+  "count_weekly" : "$TS_WEEKLY",
+  "count_daily" : "$TS_DAILY",
+  "count_hourly" : "6",
+  "count_boot" : "5",
+  "snapshot_size" : "0",
+  "snapshot_count" : "0",
+  "date_format" : "%Y-%m-%d %H:%M:%S",
+  "exclude" : [],
+  "exclude-apps" : []
+}
+EOF
+        echo "==> [chroot] Timeshift: Btrfs mode, $TS_DAILY daily + $TS_WEEKLY weekly snapshots"
+    fi
 
     # ---- Flatpak + Flathub ----
     install_each flatpak
@@ -2475,6 +2591,28 @@ do_chroot_run() {
     restore_resolv
 }
 
+# The initramfs must be able to open the disk at boot. Reads the newest initrd of the new
+# system: Btrfs support is expected, and with LUKS the unlock (crypt) part is REQUIRED.
+# Output is captured in a variable first (no "cmd | grep -q": that can fail with SIGPIPE).
+check_initrd() {
+    local img rel out="" tool=""
+    img=$(ls "$MP"/boot/initrd.img-* 2>/dev/null | sort -V | tail -n1 || true)
+    if [ -z "$img" ]; then return 0; fi
+    rel=/boot/${img##*/}
+    if chroot "$MP" sh -c 'command -v lsinitrd' >/dev/null 2>&1; then tool=lsinitrd
+    elif chroot "$MP" sh -c 'command -v lsinitramfs' >/dev/null 2>&1; then tool=lsinitramfs
+    else warn "No tool to inspect the initramfs; check skipped."; return 0; fi
+    out=$(chroot "$MP" "$tool" "$rel" 2>/dev/null || true)
+    if [ -z "$out" ]; then warn "Could not read $rel; initramfs check skipped."; return 0; fi
+    if ! grep -qi 'btrfs' <<<"$out"; then
+        warn "The initramfs $rel does not seem to contain Btrfs support. If the system does not boot, run: sudo update-initramfs -u -k all"
+    fi
+    if [ "$USE_LUKS" = true ] && ! grep -qi 'crypt' <<<"$out"; then
+        die "The initramfs $rel has NO disk-unlock (crypt) part although the root is encrypted: the system would not boot. Open a shell (s), run: chroot $MP update-initramfs -u -k all   then choose retry."
+    fi
+    ok "Initramfs checked ($rel)"
+}
+
 do_verify() {
     local f efi_ok=false
     grep -q "$FS_UUID" "$MP/etc/fstab"   || die "fstab does not contain the root UUID."
@@ -2487,6 +2625,7 @@ do_verify() {
     done
     if [ "$efi_ok" != true ]; then die "No GRUB EFI binary found in the EFI partition."; fi
     if [ "$USE_LUKS" = true ] && [ ! -s "$MP/etc/crypttab" ]; then die "crypttab is empty although LUKS is used."; fi
+    check_initrd
     ok "Installed system verified"
 }
 
